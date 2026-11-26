@@ -95,11 +95,12 @@ def handle(request):
     method = request.get("method", "")
     req_id = request.get("id")
     if method == "initialize":
+        req_version = (request.get("params") or {}).get("protocolVersion")
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": req_version or PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
             },
@@ -150,35 +151,87 @@ def serve_stdio():
 
 
 def serve_http(port):
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import uuid
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):  # keep stdout clean
-            pass
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("REQ %s\n" % (fmt % args))
+
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-Id",
+            )
+            self.send_header(
+                "Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version"
+            )
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _read_body(self):
+            if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+                chunks = []
+                while True:
+                    size_line = self.rfile.readline(65536).strip()
+                    try:
+                        size = int(size_line.split(b";")[0], 16)
+                    except ValueError:
+                        break
+                    if size == 0:
+                        while True:
+                            line = self.rfile.readline(65536)
+                            if line in (b"\r\n", b"\n", b""):
+                                break
+                        break
+                    chunks.append(self.rfile.read(size))
+                    self.rfile.readline(65536)
+                return b"".join(chunks)
+            length = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(length) if length else b""
 
         def do_POST(self):
             if self.path.split("?")[0] not in ("/mcp", "/"):
                 self.send_response(404)
+                self._cors()
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
+            raw = self._read_body()
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
+                sys.stderr.write("BADJSON %r\n" % raw[:200])
                 self.send_response(400)
+                self._cors()
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             requests = payload if isinstance(payload, list) else [payload]
+            methods = [q.get("method") for q in requests if isinstance(q, dict)]
+            sys.stderr.write("POST methods=%s\n" % methods)
             responses = [r for r in (handle(q) for q in requests) if r is not None]
             if not responses:
                 self.send_response(202)
+                self._cors()
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             body = json.dumps(responses[0] if len(responses) == 1 else responses)
             data = body.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            if "initialize" in methods:
+                self.send_header("Mcp-Session-Id", uuid.uuid4().hex)
+            self._cors()
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -186,9 +239,11 @@ def serve_http(port):
         def do_GET(self):
             # This dummy does not offer a server-initiated SSE stream.
             self.send_response(405)
+            self._cors()
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
